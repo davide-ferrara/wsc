@@ -1,1 +1,0 @@
-2025-12-02 15:02:13 INFO  wsc.c:77: Server HTTP in ascolto su 0.0.0.0:6969
