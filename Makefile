@@ -8,4 +8,4 @@ run: main
 	./$(PROGRAM_NAME)
 
 clean:
-	rm $(PROGRAM_NAME)
+	rm $(PROGRAM_NAME) log.txt
