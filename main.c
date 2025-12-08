@@ -1,7 +1,7 @@
 #include "log.h"
 #include "wsc.h"
 
-int main(int argc, char *argv[]) {
+int main(void) {
   int wsc = wsc_run("0.0.0.0", 6969);
 
   if (wsc == -1) {
