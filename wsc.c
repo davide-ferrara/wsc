@@ -57,7 +57,7 @@ static void *client_thread_handler(void *args) {
   int client_sock = *(int *)args;
   free(args);
 
-  http_handle_client(client_sock);
+  httpHandleClient(client_sock);
 
   return NULL;
 }

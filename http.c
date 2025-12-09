@@ -1,18 +1,18 @@
 #include "http.h"
 #include "log.h"
 #include "sds.h"
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/socket.h>
 #include <sys/types.h>
-
-#define HTTP_V "HTTP/1.1"
 
 /*
  * Read a file and return it's file descriptor
  * @param file path
-*/
-FILE *file_open(char *path) {
+ */
+FILE *fileOpen(char *path) {
   FILE *file = fopen(path, "r");
   if (file == NULL) {
     log_error("Could not read %s", path);
@@ -25,8 +25,8 @@ FILE *file_open(char *path) {
  * Read a file and calcutale it's lenght.
  * Used to calcutale the Header Content-Length.
  * @param file descriptor
-*/
-ssize_t file_len(FILE *file) {
+ */
+ssize_t fileLen(FILE *file) {
   long int len;
 
   if (fseek(file, 0, SEEK_END)) {
@@ -47,28 +47,20 @@ ssize_t file_len(FILE *file) {
  * @buff buffer to write byte read
  * @len how many bytes to read
  * */
-ssize_t file_read(FILE *file, char *buf, ulong len) {
+ssize_t fileRead(FILE *file, char *buf, ulong len) {
   return fread(buf, sizeof(char), len, file);
 }
 
-/*
- * TODO docs
- * */
-static int consume_token(char **cursor, char delimeter, char **out_token) {
-  char *p = *cursor;
-  *out_token = p;
-
-  while (*p && *p != delimeter && *p != '\r' && *p != '\n') {
-    p++;
+int fileEndsWithHtml(char *filename, size_t len) {
+  if (len < 5) {
+    return 1;
   }
 
-  if (*p == delimeter) {
-    *p = '\0';
-    *cursor = p + 1;
-    return 0;
-  }
+  char *end = (filename + len) - 1;
 
-  return -1;
+  return (*(end) | 0x20) == 'l' && (*(end - 1) | 0x20) == 'm' &&
+         (*(end - 2) | 0x20) == 't' && (*(end - 3) | 0x20) == 'h' &&
+         (*(end - 4) | 0x20) == '.';
 }
 
 /*
@@ -77,263 +69,297 @@ static int consume_token(char **cursor, char delimeter, char **out_token) {
  * @param buffer of chars
  * @param len of the buffer
  * */
-static int is_end_of_header(const char *buf, size_t len) {
-  if (len < 4) {
+static int endOfHeader(client *c) {
+  if (c->buf.len < 4) {
     return -1;
   }
   // Pointer to the end of the buf
-  const char *end = buf + len;
+  // TODO change with strpbrk()
+  const char *end = c->buf.buf + c->buf.len;
   return (end[-4] == '\r' && end[-3] == '\n' && end[-2] == '\r' &&
           end[-1] == '\n');
 }
 
-static int http_parse_header(client *c) {
-  char *p = c->header_buff;
+char *nextToken(char *buf, char delimter) {
+  if (buf == NULL) {
+    return NULL;
+  }
 
-  // Parse Request Line
-  if (consume_token(&p, ' ', &c->http_header->request_line.method) == -1) {
+  char *c = strchr(buf, delimter);
+  if (c) {
+    *c = '\0';
+    return c + 1;
+  }
+
+  return NULL;
+}
+
+int parseRequestLine(char *buf, http_req_line_t *rql) {
+  rql->method = buf;
+  char *next = nextToken(buf, ' ');
+  if (next == NULL) {
     log_error("Error while parsing metohd, missing a space!");
     return -1;
   }
 
-  if (consume_token(&p, ' ', &c->http_header->request_line.target) == -1) {
+  rql->target = next;
+  next = nextToken(next, ' ');
+  if (next == NULL) {
     log_error("Error while parsing target, missing a space!");
     return -1;
   }
 
-  if (consume_token(&p, '\r', &c->http_header->request_line.http_version) ==
-      -1) {
+  rql->version = next;
+  char *end = nextToken(next, '\r');
+  if (end == NULL) {
     log_error("Error while parsing version, CRLF is missing");
     return -1;
   }
 
-  /* Skips the /n char */
-  if (*p == '\n')
-    p++;
+  *(end) = '\0';
+  return 0;
+}
 
-  c->http_header->headers_count = 0;
+static int parseRequestHeaders(void) { return 0; }
 
-  while (*p && c->http_header->headers_count < MAX_HTTP_HEADERS) {
+static int parseRequest(client *c) {
+  char *buf = c->buf.buf;
 
-    // Se la riga inizia con \r o \n, è la riga vuota che segna la fine.
-    if (*p == '\r' || *p == '\n') {
+  if (parseRequestLine(buf, &c->req.line) == -1) {
+    log_error("Request line parsing has failed!");
+    return -1;
+  }
+
+  // TODO
+  parseRequestHeaders();
+
+  return 0;
+}
+
+static void addResponseHeader(client *c, char *key, char *value) {
+  if (c->resp.headers_count >= MAX_RESPONSE_HEADERS) {
+    return;
+  }
+  int i = c->resp.headers_count;
+  c->resp.headers[i].key = key;
+  c->resp.headers[i].value = value;
+}
+
+#define HTTP_OK 200
+#define HTTP_NOT_FOUND 404
+#define HTTP_INT_SERV_ERR 500
+static const char *getReasonPhrase(int code) {
+  switch (code) {
+  case HTTP_OK:
+    return "OK";
+  case HTTP_NOT_FOUND:
+    return "Not Found";
+  case HTTP_INT_SERV_ERR:
+    return "Internal Server Error";
+  default:
+    return "Unknown";
+  }
+}
+
+// https://developer.mozilla.org/en-US/docs/Web/HTTP/Guides/Messages#http_responses
+static void addStatusLine(client *c) {
+  if (c->resp.buf)
+    sdsfree(c->resp.buf);
+
+  c->resp.buf = sdsempty();
+  c->resp.buf = sdscatprintf(c->resp.buf, "%s %d %s\r\n", HTTP_V, c->resp.code,
+                             getReasonPhrase(c->resp.code));
+  return;
+}
+
+static void addHeaders(client *c) {
+  for (ssize_t i = 0; i < c->resp.headers_count; i++) {
+    c->resp.buf =
+        sdscatprintf(c->resp.buf, "%s: %s \r\n", c->resp.headers[i].key,
+                     c->resp.headers[i].value);
+  }
+  return;
+}
+
+static void addCRLF(client *c) {
+  c->resp.buf = sdscatprintf(c->resp.buf, "\r\n");
+}
+
+static void addBody(client *c) {
+  c->resp.buf = sdscatprintf(c->resp.buf, "%s", c->resp.body);
+  return;
+}
+
+static int prepareResponse(client *c) {
+  addStatusLine(c);
+  addHeaders(c);
+  addCRLF(c);
+  addBody(c);
+
+  log_debug("HTTP Response: %s", c->resp.buf);
+  return 0;
+}
+
+static void sendError() { return; }
+static void sendFile() { return; }
+
+static void handleGet(client *c) {
+  char index[] = "index.html";
+
+  // Path Resolution
+  const char *target = c->req.line.target;
+  if (strcmp(target, "/") == 0) {
+    FILE *file = fileOpen(index);
+    if (file == NULL) {
+      log_error("Could not open file.");
+      sendError();
+      return;
+    }
+
+    c->resp.body_len = fileLen(file);
+    if (c->resp.body_len < 0) {
+      log_error("Could not read file len.");
+      sendError();
+      return;
+    }
+
+    log_debug("Content-Length: %zu", c->resp.body_len);
+
+    c->resp.body = (char *)malloc(c->resp.body_len + 1);
+    if (c->resp.body == NULL) {
+      log_error("Could not allocate memory for response body!");
+      sendError();
+      return;
+    }
+
+    ssize_t byte_read = fileRead(file, c->resp.body, c->resp.body_len);
+    if (byte_read < c->resp.body_len) {
+      log_error("Could not read all bytes from file.");
+      sendError();
+      return;
+    }
+    fclose(file);
+
+    c->resp.body[c->resp.body_len] = '\0';
+    c->resp.code = HTTP_OK;
+
+    if (fileEndsWithHtml(index, strlen(index))) {
+      addResponseHeader(c, "Content-Type", "text/html");
+    } else {
+      addResponseHeader(c, "Content-Type", "text/plain");
+    }
+
+    addResponseHeader(c, "Content-Length", sdsfromlonglong(c->resp.body_len));
+  }
+
+  if (prepareResponse(c) == -1) {
+    log_error("Could not prepare response.");
+    sendError();
+    return;
+  }
+  return;
+}
+
+static void handlePost(client *c) { return; }
+
+static void dispatchRequest(client *c) {
+  int get = strcmp(c->req.line.method, "GET") == 0;
+  int post = strcmp(c->req.line.method, "POST") == 0;
+
+  if (get) {
+    log_info("Recived HTTP GET request from client.");
+    handleGet(c);
+  } else if (post) {
+    log_info("Recived HTTP POST request from client.");
+    handlePost(c);
+  } else {
+    sendError();
+  }
+}
+
+static void sendResponse(client *c) {}
+
+void httpHandleClient(int fd) {
+  // TODO init inside a fun
+  client *c = (client *)malloc(sizeof(*c));
+  if (c == NULL)
+    pthread_exit((void *)-1);
+  memset(c, 0, sizeof(*c));
+
+  c->fd = fd;
+  c->buf.cap = REQUEST_CAPACITY;
+  c->buf.len = 0;
+  c->buf.buf = (char *)malloc(sizeof(char) * c->buf.cap);
+
+  // TODO separate into Read Client FD
+  while (1) {
+    ssize_t free_space = (c->buf.cap) - (c->buf.len);
+    if (free_space < 1024) {
+      log_debug("Reqeust buf is almost full, reallocating...");
+      c->buf.cap *= 2;
+
+      char *new_buff = realloc(c->buf.buf, sizeof(char) * c->buf.cap);
+      if (new_buff == NULL) {
+        log_error("Could not allocate memory for request buffer!");
+        pthread_exit((void *)-1);
+      }
+
+      c->buf.buf = new_buff;
+
+      if (c->buf.buf == NULL) {
+        log_error("Could not allocate memory for request buffer!");
+        pthread_exit((void *)-1);
+      }
+
+      log_debug("Request buf reallocated is now %d bytes.", c->buf.cap);
+    }
+
+    ssize_t byte_read = recv(c->fd, c->buf.buf + c->buf.len, free_space, 0);
+
+    if ((int)byte_read == 0) {
+      log_error("Socket data has been read.");
       break;
     }
 
-    http_header_item_t *curr =
-        &c->http_header->headers[c->http_header->headers_count];
-
-    // Imposto la chiave all'indirizzo di p
-    curr->key = p;
-
-    // Cerco i doppi punti
-    char *colon = strchr(p, ':');
-    if (colon == NULL) {
-      log_error("Header malformato, mancano i doppi punti.");
-      return -1;
+    if ((int)byte_read == -1) {
+      log_error("Socket reading error: %s", strerror(errno));
+      break;
     }
 
-    // Al posto dei due punti metto il carattere di terminazione
-    *colon = '\0';
-    p = colon + 1;
+    c->buf.len += byte_read;
+    log_debug("Request Capacity: %zu\nRequest Len: %zu\n", c->buf.cap,
+              c->buf.len);
 
-    // Salto gli spazi vuoti
-    while (*p == ' ')
-      p++;
+    // Possible optimization only give last byte received
+    if (endOfHeader(c)) {
+      log_debug("Complete header received!");
 
-    // Assegno il valore
-    curr->value = p;
-
-    // Cerco CRLF
-    char *end_line = strpbrk(p, "\r\n");
-    if (end_line == NULL) {
-      log_error("Header malformato, manca il CRLF.");
-      return -1;
-    }
-
-    // Tronco la riga
-    *end_line = '\0';
-    p = end_line + 1;
-
-    // Aumento di 1 perché dopo \r abbiamo il \n e se inizia con \n smetterebbe
-    // il parse
-    if (*p == '\n')
-      p++;
-
-    // Aumento il counter dell'array
-    c->http_header->headers_count++;
-  }
-
-  return 0;
-}
-
-static sds http_build_reqeust_line(http_status *http_status, ssize_t *len) {
-
-  sds reqeust_line = sdscatprintf(
-      sdsempty(), "%s %d %s\r\nContent-Type: text/html\r\nContent-Length: %ld",
-      HTTP_V, http_status->code, http_status->reason_phrase, *len);
-  log_warn(reqeust_line);
-
-  return reqeust_line;
-}
-
-int http_build_header(client *c) {
-
-  FILE *file = file_open(c->target);
-  ssize_t len = file_len(file);
-
-  char *body = (char *)malloc(sizeof(char) * len + 1);
-  if (body == NULL) {
-    log_error("Could not allocate memory on the heap!");
-    return -1;
-  }
-
-  if (file_read(file, body, len) != len) {
-    log_error("Could not read target!");
-    return -1;
-  }
-
-  fclose(file);
-
-  http_status http_status = {0};
-  http_status.code = 200;
-  http_status.reason_phrase = "OK";
-
-  sds request_line = http_build_reqeust_line(&http_status, &len);
-  sds header = sdscatprintf(sdsempty(), "%s\r\n\r\n%s", request_line, body);
-  c->resp =
-      sdscatprintf(sdsempty(), "%s\r\n\r\n%s", request_line, body);
-
-  free(body);
-  sdsfree(request_line);
-
-  if (!header) {
-    log_error("Could not construct HTTP Header: %s", strerror(errno));
-    sdsfree(header);
-    return -1;
-  }
-
-  // log_warn("Header: %s", header);
-  log_warn("Header: %s", c->resp);
-
-  sdsfree(header);
-
-  return 0;
-}
-
-static int http_handle_get(client *c) {
-  if (!strcmp(c->http_header->request_line.target, "/")) {
-    strcpy(c->target, "index.html");
-
-    if (http_build_header(c) == -1) {
-      log_error("http response returned -1");
-      return -1;
+      // Now the buffer is a valid C string
+      c->buf.buf[c->buf.len] = '\0';
+      break;
     }
   }
-  return 0;
-}
 
-void http_handle_client(int sock) {
-  client *c = (client*)malloc(sizeof(*c));
-  if (c == NULL) pthread_exit((void *) -1);
-  memset(c, 0xFF, sizeof(*c));
+  parseRequest(c);
 
-  c->sock = sock;
-  c->req.cap = 4069;
-  c->req.len = 0;
-  c->req.buf = (char*)malloc(sizeof(char) * c->req.cap);
+  dispatchRequest(c);
 
-  while (1) {
-    ssize_t byte_read = recv(c->sock, c->req.buf, c->req.cap, 0);
+  // Reply
+  if (send(c->fd, c->resp.buf, sdslen(c->resp.buf), 0) == -1) {
+    log_error("Could not send HTTP response!\n");
+    free(c);
+    pthread_exit((void *)-1);
   }
 
+  log_info("HTTP Response sent to: %d\n", c->fd);
 
-  // client c = {0};
-  //
-  // request_t *req = (request_t*)malloc(sizeof(request_t) + 16);
-  // req->size = 16;
-  //
-  // c.sock = client_sock;
-  // c.header_buff_size = 64;
-  // c.header_buff_len = 0;
-  //
-  // c.req = req;
-  //
-  // c.header_buff = (char *)malloc(sizeof(char) * c.header_buff_size);
-  //
-  // while (true) {
-  //   // Bytes read from the socket
-  //   ssize_t byte_read = recv(c.sock, c.req->buf, c.req->size, 0);
-  //
-  //   if ((int)byte_read == 0) {
-  //     log_info("Tutti i dati dal socket sono stati letti!");
-  //     break;
-  //   }
-  //   if ((int)byte_read == -1) {
-  //     log_info("Errore leggendo i dati dal socket: %s", strerror(errno));
-  //     break;
-  //   }
-  //
-  //   // Controllo che in header buffer ci sia ancora spazio in caso rialloco
-  //   if (c.header_buff_len + byte_read + 1 >= c.header_buff_size) {
-  //     c.header_buff_size *= 2;
-  //     c.header_buff = (char *)realloc(c.header_buff, c.header_buff_size);
-  //     if (c.header_buff == NULL) {
-  //       log_error("OOM durante la riallocazione della memoria!");
-  //       break;
-  //     }
-  //     log_info("Header buffer riallocato di %d bytes.", c.header_buff_size);
-  //   }
-  //
-  //   // Copio i dati dal buffer di lettura in header
-  //   memcpy(c.header_buff + c.header_buff_len, c.req->buf, byte_read);
-  //   c.header_buff_len += byte_read;
-  //
-  //   if (is_end_of_header(c.header_buff, c.header_buff_len)) {
-  //     log_info("Header completo ricevuto!");
-  //
-  //     // Lo trasformo in stringa ed esco dal while
-  //     c.header_buff[c.header_buff_len] = '\0';
-  //     break;
-  //   }
-  // }
-  //
-  // c.http_header = (http_header_t *)malloc(sizeof(http_header_t));
-  //
-  // http_parse_header(&c);
-  //
-  // // log_info("HTTP Header Request Method: %s",
-  // // c.http_header.request_line.method); log_info("HTTP Header Request Target:
-  // // %s", c.http_header.request_line.target); log_info("HTTP Header Request HTTP
-  // // Version: %s",
-  // //          c.http_header.request_line.http_version);
-  // // log_info("HTPP Headers count: %d", c.http_header.headers_count);
-  // //
-  // // for (int i = 0; i < c.http_header.headers_count; i++) {
-  // //   log_info("HTTP %s:%s", c.http_header.headers[i].key,
-  // //            c.http_header.headers[i].value);
-  // // }
-  //
-  // c.http_response = sdsempty();
-  //
-  // if (strcmp(c.http_header->request_line.method, "GET") == 0) {
-  //   int res = http_handle_get(&c);
-  //
-  //   if (res == -1)
-  //     log_error("Error in handle get");
-  //
-  //   if (c.http_response &&
-  //       send(client_sock, c.http_response, strlen(c.http_response), 0) == -1) {
-  //     log_error("Errore nell'invio del messaggio!\n");
-  //     pthread_exit((void *)-1);
-  //   }
-  //   log_info("Inviata una risposta al socket: %d\n", c.sock);
-  //
-  //   if (close(client_sock) == -1) {
-  //     log_error("Errore nella chiusura del socket: %s\n", strerror(errno));
-  //     pthread_exit((void *)-1);
-  //   }
-  //
-  //   pthread_exit((void *)0);
-  // }
+  // Cleanup
+  if (close(c->fd) == -1) {
+    log_error("Error while closing the socket: %s\n", strerror(errno));
+    free(c);
+    pthread_exit((void *)-1);
+  }
+
+  free(c);
+  pthread_exit((void *)0);
 }
